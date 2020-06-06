@@ -74,6 +74,11 @@ class DiscordClient(Client):
         self.protocol = protocol
         self._event_thread = None
         loop = asyncio.new_event_loop()
+
+        # XXX Fix for discord.py only!
+        # We shouldn't really set the event loop in this thread since it will run in another.
+        asyncio.set_event_loop(loop)
+
         super().__init__(loop=loop)
 
     async def on_connect(self):
