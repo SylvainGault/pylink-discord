@@ -72,8 +72,9 @@ class DiscordClient(Client):
 
     def __init__(self, protocol):
         self.protocol = protocol
-        self.loop = asyncio.new_event_loop()
-        super().__init__()
+        self._event_thread = None
+        loop = asyncio.new_event_loop()
+        super().__init__(loop=loop)
 
     async def on_connect(self):
         self.me = self.user
@@ -599,6 +600,13 @@ class DiscordClient(Client):
                                   target=self.loop.run_until_complete, args=(coro,),
                                   daemon=True)
         thread.start()
+        self._event_thread = thread
+
+    def close(self):
+        coro = super().close()
+        self._run_coro(coro)
+        self.loop.stop()
+        self._event_thread.join()
 
 
 class DiscordServer(ClientbotBaseProtocol):
@@ -1073,8 +1081,7 @@ class PyLinkDiscordProtocol(PyLinkNetworkCoreWithUtils):
         for child in children:
             self._remove_child(child)
 
-        self.client.gw.shutting_down = True
-        self.client.gw.ws.close()
+        self.client.close()
 
         self._post_disconnect()
 
