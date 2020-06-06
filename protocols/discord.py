@@ -18,29 +18,19 @@
 
 __version__ = '0.2.0'
 
+import asyncio
 import calendar
 import time
 import collections
 import string
 import urllib.parse
 
-import socket, gevent.socket
-
-if socket.socket is not gevent.socket.socket:
-    raise ImportError("gevent patching must be enabled for protocols/discord to work. "
-                      "Make sure you are starting with the pylink-discord launcher.")
-
-from disco.api.http import APIException
-from disco.bot import Bot, BotConfig
-from disco.bot import Plugin
-from disco.client import Client, ClientConfig
-from disco.gateway import events
-from disco.types import Guild, Channel as DiscordChannel, GuildMember, Message
-from disco.types.channel import ChannelType
-from disco.types.permissions import Permissions
-from disco.types.user import Status as DiscordStatus
-#from disco.util.logging import setup_logging
-from holster.emitter import Priority
+from discord import Client
+from discord.errors import HTTPException
+from discord.enums import ChannelType, Status as DiscordStatus
+from discord.permissions import Permissions
+from discord.message import Message
+from discord.abc import GuildChannel
 
 from pylinkirc import structures, utils
 from pylinkirc.classes import *
@@ -69,33 +59,24 @@ class DiscordChannelState(structures.CaseInsensitiveDict):
             raise KeyError("Cannot convert channel ID %r to int" % key)
         return key
 
-class DiscordBotPlugin(Plugin):
-    # TODO: maybe this could be made configurable?
-    # N.B. iteration order matters: we stop adding lower modes once someone has +o, much like
-    #      real services
-    irc_discord_perm_mapping = collections.OrderedDict(
-        [('admin', Permissions.ADMINISTRATOR),
-         ('op', Permissions.MANAGE_MESSAGES),
-         ('halfop', Permissions.KICK_MEMBERS),
-         ('voice', Permissions.SEND_MESSAGES),
-        ])
+class DiscordClient(Client):
     me = None
     status_mapping = {
-        'ONLINE': 'Online',
-        'IDLE': 'Idle',
-        'DND': 'Do Not Disturb',
-        'INVISIBLE': 'Offline',  # not a typo :)
-        'OFFLINE': 'Offline',
+        DiscordStatus.online: 'Online',
+        DiscordStatus.idle: 'Idle',
+        DiscordStatus.dnd: 'Do Not Disturb',
+        DiscordStatus.invisible: 'Offline',  # not a typo :)
+        DiscordStatus.offline: 'Offline',
     }
     _dm_channels = {}
 
-    def __init__(self, protocol, bot, config):
+    def __init__(self, protocol):
         self.protocol = protocol
-        super().__init__(bot, config)
+        self.loop = asyncio.new_event_loop()
+        super().__init__()
 
-    @Plugin.listen('Ready')
-    def on_ready(self, event, *args, **kwargs):
-        self.me = event.user
+    async def on_connect(self):
+        self.me = self.user
         self.protocol.connected.set()
 
     def _burst_guild(self, guild):
@@ -110,13 +91,13 @@ class DiscordBotPlugin(Plugin):
         pylink_netobj._guild_name = guild.name
 
         # Create a user for ourselves.
-        member = guild.members[self.me.id]
+        member = guild.get_member(self.me.id)
         pylink_netobj.pseudoclient = pylink_netobj.users[self.me.id] = \
             User(pylink_netobj, nick=member.name,
                  ts=calendar.timegm(member.joined_at.timetuple()),
                  uid=self.me.id, server=guild.id)
 
-        for member in guild.members.values():
+        for member in guild.members:
             self._burst_new_client(guild, member, pylink_netobj)
 
         pylink_netobj.connected.set()
@@ -126,15 +107,14 @@ class DiscordBotPlugin(Plugin):
         """
         Updates channel presence & IRC modes for the given member, or all guild members if not given.
         """
-        if channel.type == ChannelType.GUILD_CATEGORY:
+        if channel.type == ChannelType.category:
             # XXX: there doesn't seem to be an easier way to get this. Fortunately, there usually
             # aren't too many channels in one guild...
-            for subchannel in guild.channels.values():
-                if subchannel.parent_id == channel.id:
-                    log.debug('(%s) _update_channel_presence: checking channel %s/%s in category %s/%s', self.protocol.name, subchannel.id, subchannel, channel.id, channel)
-                    self._update_channel_presence(guild, subchannel, member=member, relay_modes=relay_modes)
+            for subchannel in channel.channels:
+                log.debug('(%s) _update_channel_presence: checking channel %s/%s in category %s/%s', self.protocol.name, subchannel.id, subchannel, channel.id, channel)
+                self._update_channel_presence(guild, subchannel, member=member, relay_modes=relay_modes)
             return
-        elif channel.type != ChannelType.GUILD_TEXT:
+        elif channel.type != ChannelType.text:
             log.debug('(%s) _update_channel_presence: ignoring non-text channel %s/%s', self.protocol.name, channel.id, channel)
             return
 
@@ -151,16 +131,16 @@ class DiscordBotPlugin(Plugin):
         try:
             pylink_channel = pylink_netobj.channels[channel.id]
             pylink_channel.name = str(channel)
-            log.debug("(%s) Retrieved channel %s for channel ID %s", self.name, pylink_channel, channel.id)
+            log.debug("(%s) Retrieved channel %s for channel ID %s", self.protocol.name, pylink_channel, channel.id)
         except KeyError:
             pylink_channel = pylink_netobj.channels[channel.id] = Channel(self, name=str(channel))
-            log.debug("(%s) Created new channel %s for channel ID %s", self.name, pylink_channel, channel.id)
+            log.debug("(%s) Created new channel %s for channel ID %s", self.protocol.name, pylink_channel, channel.id)
 
         pylink_channel.discord_id = channel.id
         pylink_channel.discord_channel = channel
 
         if member is None:
-            members = guild.members.values()
+            members = guild.members
         else:
             members = [member]
 
@@ -172,11 +152,11 @@ class DiscordBotPlugin(Plugin):
                 log.error("(%s) Could not update user %s(%s)/%s as the user object does not exist", self.protocol.name, guild.id, guild.name, uid)
                 return
 
-            channel_permissions = channel.get_permissions(member)
-            has_perm = channel_permissions.can(Permissions.read_messages)
+            channel_permissions = channel.permissions_for(member)
+            has_perm = channel_permissions.read_messages
             log.debug('discord: checking if member %s/%s has permission read_messages on %s/%s: %s',
                       member.id, member, channel.id, channel, has_perm)
-            #log.debug('discord: channel permissions are %s', str(channel_permissions.to_dict()))
+            #log.debug('discord: channel permissions are %s', str(list(channel_permissions)))
             if has_perm:
                 if uid not in pylink_channel.users:
                     log.debug('discord: adding member %s to %s/%s', member, channel.id, channel)
@@ -184,8 +164,8 @@ class DiscordBotPlugin(Plugin):
                     pylink_channel.users.add(uid)
 
                     # Hide offline users if join_offline_users is enabled
-                    if pylink_netobj.join_offline_users or (member.user.presence and \
-                            member.user.presence.status not in (DiscordStatus.OFFLINE, DiscordStatus.INVISIBLE)):
+                    if pylink_netobj.join_offline_users or (member.status not in
+                                (DiscordStatus.offline, DiscordStatus.invisible)):
                         users_joined.append(uid)
 
                 # Map Discord role IDs to IRC modes
@@ -251,7 +231,6 @@ class DiscordBotPlugin(Plugin):
                 if relay_modes:
                     pylink_netobj.call_hooks([guild.id, 'MODE', {'target': channel.id, 'modes': modes}])
 
-
     def _burst_new_client(self, guild, member, pylink_netobj):
         """Bursts the given member as a new PyLink client."""
         uid = member.id
@@ -261,11 +240,11 @@ class DiscordBotPlugin(Plugin):
             return
 
         if uid in pylink_netobj.users:
-            log.debug('(%s) Not reintroducing user %s/%s', self.protocol.name, uid, member.user.username)
+            log.debug('(%s) Not reintroducing user %s/%s', self.protocol.name, uid, member.name)
             pylink_user = pylink_netobj.users[uid]
         elif uid != self.me.id:
-            tag = str(member.user)  # get their name#1234 tag
-            username = member.user.username  # this is just the name portion
+            tag = str(member)  # get their name#1234 tag
+            username = member.name  # this is just the name portion
             realname = '%s @ Discord/%s' % (tag, guild.name)
             # Prefer the person's guild nick (nick=member.name) if defined
             pylink_netobj.users[uid] = pylink_user = User(pylink_netobj, nick=member.name,
@@ -274,7 +253,7 @@ class DiscordBotPlugin(Plugin):
                                                           ts=calendar.timegm(member.joined_at.timetuple()), uid=uid, server=guild.id)
             pylink_user.modes.add(('i', None))
             pylink_user.services_account = str(uid)  # Expose their UID as a services account
-            if member.user.bot:
+            if member.bot:
                 pylink_user.modes.add(('B', None))
             pylink_user.discord_user = member
 
@@ -294,121 +273,113 @@ class DiscordBotPlugin(Plugin):
         else:
             return
         # Update user presence
-        self._update_user_status(guild, uid, member.user.presence)
+        self._update_user_status(guild, uid, member.status)
 
         # Calculate which channels the user belongs to
-        for channel in guild.channels.values():
-            if channel.type == ChannelType.GUILD_TEXT:
+        for channel in guild.channels:
+            if channel.type == ChannelType.text:
                 self._update_channel_presence(guild, channel, member)
         return pylink_user
 
-    @Plugin.listen('GuildCreate')
-    def on_server_connect(self, event: events.GuildCreate, *args, **kwargs):
-        log.info('(%s) got GuildCreate event for guild %s/%s', self.protocol.name, event.guild.id, event.guild.name)
-        self._burst_guild(event.guild)
+    def _on_guild_create(self, guild):
+        log.info('(%s) got GuildCreate event for guild %s/%s', self.protocol.name, guild.id, guild.name)
+        self._burst_guild(guild)
 
-    @Plugin.listen('GuildUpdate')
-    def on_server_update(self, event: events.GuildUpdate, *args, **kwargs):
-        log.info('(%s) got GuildUpdate event for guild %s/%s', self.protocol.name, event.guild.id, event.guild.name)
+    async def on_guild_available(self, guild):
+        self._on_guild_create(guild)
+
+    async def on_guild_join(self, guild):
+        self._on_guild_create(guild)
+
+    async def on_guild_update(self, old_guild, guild):
+        log.info('(%s) got GuildUpdate event for guild %s/%s', self.protocol.name, guild.id, guild.name)
         try:
-            pylink_netobj = self.protocol._children[event.guild.id]
+            pylink_netobj = self.protocol._children[guild.id]
         except KeyError:
-            log.error("(%s) Could not update guild %s/%s as the corresponding network object does not exist", self.protocol.name, event.guild.id, event.guild.name)
+            log.error("(%s) Could not update guild %s/%s as the corresponding network object does not exist", self.protocol.name, guild.id, guild.name)
             return
         else:
-            pylink_netobj._guild_name = event.guild.name
+            pylink_netobj._guild_name = guild.name
 
-    @Plugin.listen('GuildDelete')
-    def on_server_delete(self, event: events.GuildDelete, *args, **kwargs):
-        log.info('(%s) Got kicked from guild %s, triggering a disconnect', self.protocol.name, event.id)
-        self.protocol._remove_child(event.id)
+    async def on_guild_remove(self, guild):
+        log.info('(%s) Got kicked from guild %s, triggering a disconnect', self.protocol.name, guild.id)
+        self.protocol._remove_child(guild.id)
 
-    @Plugin.listen('GuildMembersChunk')
-    def on_member_chunk(self, event: events.GuildMembersChunk, *args, **kwargs):
-        log.debug('(%s) got GuildMembersChunk event for guild %s/%s: %s', self.protocol.name, event.guild.id, event.guild.name, event.members)
+    async def on_guild_unavailable(self, guild):
+        log.info('(%s) Guild %s was removed, triggering a disconnect', self.protocol.name, guild.id)
+        self.protocol._remove_child(guild.id)
+
+    async def on_member_join(self, member):
+        guild = membre.guild
+        log.info('(%s) got GuildMemberAdd event for guild %s/%s: %s', self.protocol.name, guild.id, guild.name, member)
         try:
-            pylink_netobj = self.protocol._children[event.guild.id]
+            pylink_netobj = self.protocol._children[guild.id]
         except KeyError:
-            log.error("(%s) Could not burst users %s as the parent network object does not exist", self.protocol.name, event.members)
+            log.error("(%s) Could not burst user %s as the parent network object does not exist", self.protocol.name, member)
+            return
+        self._burst_new_client(guild, member, pylink_netobj)
+
+    async def on_member_update(self, old_member, member):
+        guild = member.guild
+        log.info('(%s) got GuildMemberUpdate event for guild %s/%s: %s', self.protocol.name, guild.id, guild.name, member)
+        try:
+            pylink_netobj = self.protocol._children[guild.id]
+        except KeyError:
+            log.error("(%s) Could not update user %s as the parent network object does not exist", self.protocol.name, member)
             return
 
-        for member in event.members:
-            self._burst_new_client(event.guild, member, pylink_netobj)
-
-    @Plugin.listen('GuildMemberAdd')
-    def on_member_add(self, event: events.GuildMemberAdd, *args, **kwargs):
-        log.info('(%s) got GuildMemberAdd event for guild %s/%s: %s', self.protocol.name, event.guild.id, event.guild.name, event.member)
-        try:
-            pylink_netobj = self.protocol._children[event.guild.id]
-        except KeyError:
-            log.error("(%s) Could not burst user %s as the parent network object does not exist", self.protocol.name, event.member)
-            return
-        self._burst_new_client(event.guild, event.member, pylink_netobj)
-
-    @Plugin.listen('GuildMemberUpdate')
-    def on_member_update(self, event: events.GuildMemberUpdate, *args, **kwargs):
-        log.info('(%s) got GuildMemberUpdate event for guild %s/%s: %s', self.protocol.name, event.guild.id, event.guild.name, event.member)
-        try:
-            pylink_netobj = self.protocol._children[event.guild.id]
-        except KeyError:
-            log.error("(%s) Could not update user %s as the parent network object does not exist", self.protocol.name, event.member)
-            return
-
-        uid = event.member.id
+        uid = member.id
         pylink_user = pylink_netobj.users.get(uid)
         if not pylink_user:
-            self._burst_new_client(event.guild, event.member, pylink_netobj)
+            self._burst_new_client(guild, member, pylink_netobj)
             return
 
         # Handle NICK changes
         oldnick = pylink_user.nick
-        if pylink_user.nick != event.member.name:
-            pylink_user.nick = event.member.name
-            pylink_netobj.call_hooks([uid, 'NICK', {'newnick': event.member.name, 'oldnick': oldnick}])
+        if pylink_user.nick != member.name:
+            pylink_user.nick = member.name
+            pylink_netobj.call_hooks([uid, 'NICK', {'newnick': member.name, 'oldnick': oldnick}])
 
         # Relay permission changes as modes
-        for channel in event.guild.channels.values():
-            if channel.type == ChannelType.GUILD_TEXT:
-                self._update_channel_presence(event.guild, channel, event.member, relay_modes=True)
+        for channel in guild.channels:
+            if channel.type == ChannelType.text:
+                self._update_channel_presence(guild, channel, member, relay_modes=True)
 
-    @Plugin.listen('GuildMemberRemove')
-    def on_member_remove(self, event: events.GuildMemberRemove, *args, **kwargs):
-        log.info('(%s) got GuildMemberRemove event for guild %s: %s', self.protocol.name, event.guild_id, event.user)
+    async def on_member_remove(self, member):
+        guild = member.guild
+        log.info('(%s) got GuildMemberRemove event for guild %s: %s', self.protocol.name, guild.id, member)
         try:
-            pylink_netobj = self.protocol._children[event.guild_id]
+            pylink_netobj = self.protocol._children[guild.id]
         except KeyError:
-            log.debug("(%s) Could not remove user %s as the parent network object does not exist", self.protocol.name, event.user)
+            log.debug("(%s) Could not remove user %s as the parent network object does not exist", self.protocol.name, member)
             return
 
-        if event.user.id in pylink_netobj.users:
-            pylink_netobj._remove_client(event.user.id)
+        if member.id in pylink_netobj.users:
+            pylink_netobj._remove_client(member.id)
             # XXX: make the message configurable
-            pylink_netobj.call_hooks([event.user.id, 'QUIT', {'text': 'User left the guild'}])
+            pylink_netobj.call_hooks([member.id, 'QUIT', {'text': 'User left the guild'}])
 
-    @Plugin.listen('WebhooksUpdate')
-    def on_webhooks_update(self, event):
-        if event.channel_id in self.protocol.webhooks:
+    async def on_webhooks_update(self, channel):
+        if channel.id in self.protocol.webhooks:
             log.info('(%s) Invalidating webhook %s due to webhook update on guild %s/channel %s',
-                      self.protocol.name, self.protocol.webhooks[event.channel_id], event.guild_id, event.channel_id)
-            del self.protocol.webhooks[event.channel_id]
+                      self.protocol.name, self.protocol.webhooks[channel.id], channel.guild.id, channel.id)
+            del self.protocol.webhooks[channel.id]
 
-    @Plugin.listen('ChannelCreate')
-    @Plugin.listen('ChannelUpdate')
-    def on_channel_update(self, event):
-        # XXX: disco should be doing this for us?!
-        if event.overwrites:
-            log.debug('discord: resetting channel overrides on %s/%s: %s', event.channel.id, event.channel, event.overwrites)
-            event.channel.overwrites = event.overwrites
+    def _on_channel_create_or_update(self, channel):
         # Update channel presence via permissions for EVERYONE!
-        self._update_channel_presence(event.channel.guild, event.channel, relay_modes=True)
+        self._update_channel_presence(channel.guild, channel, relay_modes=True)
 
-    @Plugin.listen('ChannelDelete')
-    def on_channel_delete(self, event, *args, **kwargs):
-        channel = event.channel
+    async def on_guild_channel_create(self, channel):
+        self._on_channel_create_or_update(channel)
+
+    async def on_guild_channel_update(self, old_channel, channel):
+        self._on_channel_create_or_update(channel)
+
+    def _on_channel_delete(self, channel):
         try:
-            pylink_netobj = self.protocol._children[event.channel.guild_id]
+            pylink_netobj = self.protocol._children[channel.guild.id]
         except KeyError:
-            log.debug("(%s) Could not delete channel %s as the parent network object does not exist", self.protocol.name, event.channel)
+            log.debug("(%s) Could not delete channel %s as the parent network object does not exist", self.protocol.name, channel)
             return
 
         if channel.id not in pylink_netobj.channels:  # wasn't a type of channel we track
@@ -419,17 +390,21 @@ class DiscordBotPlugin(Plugin):
             pylink_netobj.users[u].channels.discard(channel.id)
         del pylink_netobj.channels[channel.id]
 
+    async def on_guild_channel_delete(self, channel):
+        self._on_channel_delete(channel)
+
+    async def on_private_channel_delete(self, channel):
+        self._on_channel_delete(channel)
+
     def _find_common_guilds(self, uid):
         """Returns a list of guilds that the user with UID shares with the bot."""
         common = []
-        for guild_id, guild in self.client.state.guilds.items():  # Check each guild we know about
-            if uid in guild.members:
-                common.append(guild_id)
+        for guild in self.guilds:  # Check each guild we know about
+            if guild.get_member(uid) is not None:
+                common.append(guild.id)
         return common
 
-    @Plugin.listen('MessageCreate')
-    def on_message(self, event: events.MessageCreate):
-        message = event.message
+    async def on_message(self, message):
         subserver = None
         target = None
 
@@ -440,7 +415,7 @@ class DiscordBotPlugin(Plugin):
             return
 
         text = message.content
-        if not message.guild:
+        if not isinstance(message.channel, GuildChannel):
             # This is a DM.
             target = self.me.id
             if message.author.id not in self._dm_channels:
@@ -473,7 +448,7 @@ class DiscordBotPlugin(Plugin):
                     # Build a list of common server *names*
                     common_servers = [nwobj.name for gid, nwobj in self.protocol._children.items() if gid in common_guilds]
                     try:
-                        message.channel.send_message(
+                        await message.channel.send(
                             "To DM me, please prefix your messages with a guild name so I know where to "
                             "process your messages: **<guild name> <command> <args>**\n"
                             "Guilds we have in common: **%s**" % ', '.join(common_servers)
@@ -505,9 +480,7 @@ class DiscordBotPlugin(Plugin):
                     return '@' + str(u)
 
             # Translate mention IDs to their names
-            text = message.replace_mentions(user_replace=format_user_mentions,
-                                            role_replace=lambda r: '@' + str(r),
-                                            channel_replace=str)
+            text = message.clean_content
 
         if not subserver:
             return
@@ -521,17 +494,30 @@ class DiscordBotPlugin(Plugin):
 
         _send(text)
         # For attachments, just send the link
-        for attachment in message.attachments.values():
+        for attachment in message.attachments:
             _send(attachment.url)
 
-    @Plugin.listen('MessageUpdate')
-    def on_message_update(self, event):
-        message = event.message
-        if not message.content:
+    async def on_raw_message_edit(self, raw):
+        data = raw.data
+        if 'content' not in data:
             # Message updates do not necessarily contain all fields, per
             # https://discordapp.com/developers/docs/topics/gateway#message-update
             log.debug('discord: Ignoring message update for %s since the content has not been changed', message)
             return
+
+        if raw.cached_message is not None:
+            message = raw.cached_message
+            message._update(data)
+        else:
+            # Fill the fields required by the Message class
+            data.setdefault('attachments', [])
+            data.setdefault('embeds', [])
+            data.setdefault('type', 0)
+            data.setdefault('pinned', False)
+            data.setdefault('mention_everyone', False)
+            data.setdefault('tts', False)
+            chan = self.get_channel(raw.channel_id)
+            message = Message(state=chan._state, channel=chan, data=data)
 
         if message.guild:
             # Optionally, allow marking edited channel messages as such.
@@ -543,10 +529,11 @@ class DiscordBotPlugin(Plugin):
                     message.content = editmsg_format % message.content
                 except TypeError:
                     log.warning('(%s) Invalid editmsg_format format, it should contain a %%s', pylink_netobj.name)
-        return self.on_message(event)
 
-    def _update_user_status(self, guild, uid, presence):
-        """Handles a Discord presence update."""
+        return await self.on_message(message)
+
+    def _update_user_status(self, guild, uid, status):
+        """Handles a Discord presence status update."""
         pylink_netobj = self.protocol._children.get(guild.id)
         if pylink_netobj:
             try:
@@ -554,27 +541,21 @@ class DiscordBotPlugin(Plugin):
             except KeyError:
                 log.exception('(%s) _update_user_status: could not fetch user %s', self.protocol.name, uid)
                 return
-            # It seems that presence updates are not sent at all for offline users, so they
-            # turn into an unset field in disco. I guess this makes sense for saving bandwidth?
-            if presence:
-                status = presence.status
-            else:
-                status = DiscordStatus.OFFLINE
 
-            if status != DiscordStatus.ONLINE:
-                awaymsg = self.status_mapping.get(status.value, 'Unknown Status')
+            if status != DiscordStatus.online:
+                awaymsg = self.status_mapping.get(status, 'Unknown Status')
             else:
                 awaymsg = ''
 
             now_invisible = None
             if not pylink_netobj.join_offline_users:
-                if status in (DiscordStatus.OFFLINE, DiscordStatus.INVISIBLE):
+                if status in (DiscordStatus.offline, DiscordStatus.invisible):
                     # If we are hiding offline users, set a special flag for relay to quit the user.
                     log.debug('(%s) Hiding user %s/%s from relay channels as they are offline', pylink_netobj.name,
                               uid, pylink_netobj.get_friendly_name(uid))
                     now_invisible = True
                     u._invisible = True
-                elif (u.away in (self.status_mapping['INVISIBLE'], self.status_mapping['OFFLINE'])):
+                elif (u.away in (self.status_mapping[DiscordStatus.invisible], self.status_mapping[DiscordStatus.offline])):
                     # User was previously offline - burst them now.
                     log.debug('(%s) Rejoining user %s/%s from as they are now online', pylink_netobj.name,
                               uid, pylink_netobj.get_friendly_name(uid))
@@ -584,9 +565,40 @@ class DiscordBotPlugin(Plugin):
             u.away = awaymsg
             pylink_netobj.call_hooks([uid, 'AWAY', {'text': awaymsg, 'now_invisible': now_invisible}])
 
-    @Plugin.listen('PresenceUpdate')
-    def on_presence_update(self, event):
-        self._update_user_status(event.guild, event.presence.user.id, event.presence)
+    async def on_member_update(self, old_member, member):
+        self._update_user_status(member.guild, member.id, member.status)
+
+    def _run_coro(self, coro):
+        """
+        Run a coroutine and return the result.
+        /!\ Must not be called from the event loop thread
+        """
+        fut = asyncio.run_coroutine_threadsafe(coro, loop=self.loop)
+        return fut.result()
+
+    def send(self, chan, *args, **kwargs):
+        coro = chan.send(*args, **kwargs)
+        return self._run_coro(coro)
+
+    def create_dm(self, user):
+        coro = user.create_dm()
+        return self._run_coro(coro)
+
+    def webhooks(self, channel):
+        coro = channel.webhooks()
+        return self._run_coro(coro)
+
+    def webhook_execute(self, webhook, *args, **kwargs):
+        coro = webhook.execute(*args, **kwargs)
+        return self._run_coro(coro)
+
+    def start(self, token):
+        name = self.protocol.name
+        coro = super().start(token)
+        thread = threading.Thread(name="Discord client thread for %s" % name,
+                                  target=self.loop.run_until_complete, args=(coro,),
+                                  daemon=True)
+        thread.start()
 
 
 class DiscordServer(ClientbotBaseProtocol):
@@ -597,8 +609,8 @@ class DiscordServer(ClientbotBaseProtocol):
         self.virtual_parent = parent
 
         # Convenience variables
-        self.bot_plugin = parent.bot_plugin
-        self.guild = self.bot_plugin.client.state.guilds[server_id]
+        self.client = parent.client
+        self.guild = self.client.get_guild(server_id)
 
         # Try to find a predefined server name; if that fails, use the server id.
         # We don't use the guild name as the PyLink network name because they can be
@@ -687,17 +699,17 @@ class DiscordServer(ClientbotBaseProtocol):
 
     def is_internal_client(self, uid, **kwargs):
         """Returns whether the given UID is an internal PyLink client."""
-        return uid == self.bot_plugin.me.id or super().is_internal_client(uid, **kwargs)
+        return uid == self.client.me.id or super().is_internal_client(uid, **kwargs)
 
     def message(self, source, target, text, notice=False):
         """Sends messages to the target."""
-        if target in self.virtual_parent.client.state.users:
+        if self.virtual_parent.client.get_user(target) is not None:
             try:
-                discord_target = self.bot_plugin._dm_channels[target]
+                discord_target = self.client._dm_channels[target]
                 log.debug('(%s) Found DM channel for %s: %s', self.name, target, discord_target)
             except KeyError:
-                u = self.virtual_parent.client.state.users[target]
-                discord_target = self.bot_plugin._dm_channels[target] = u.open_dm()
+                u = self.virtual_parent.client.get_user(target)
+                discord_target = self.client._dm_channels[target] = self.client.create_dm(user)
                 log.debug('(%s) Creating new DM channel for %s: %s', self.name, target, discord_target)
 
         elif target in self.channels:
@@ -739,7 +751,7 @@ class DiscordServer(ClientbotBaseProtocol):
         Changes the nick of the main PyLink bot or a virtual client.
         """
         if self.pseudoclient.uid == source:
-            my_member = self.guild.get_member(self.bot_plugin.me)
+            my_member = self.guild.get_member(self.client.me)
             my_member.set_nickname(newnick)
         elif self.is_internal_client(source):
             super().nick(source, newnick)
@@ -761,7 +773,7 @@ class QueuedMessage:
         """
         Creates a queued message for Discord.
 
-        target: the target Discord channel (disco.types.Channel)
+        channel: the target Discord channel (discord.abc.Messageable)
         pylink_target: the original PyLink message target (int, Discord UID or channel ID)
         text: the message text (str)
         sender: optionally, a PyLink User object corresponding to the sender
@@ -782,15 +794,7 @@ class PyLinkDiscordProtocol(PyLinkNetworkCoreWithUtils):
         if 'token' not in self.serverdata:
             raise ProtocolError("No API token defined under server settings")
 
-        client_config = ClientConfig({'token': self.serverdata['token'],
-                                      'max_reconnects': 0})
-        self.client = Client(client_config)
-
-        bot_config = BotConfig()
-        self.bot = Bot(self.client, bot_config)
-
-        self.bot_plugin = DiscordBotPlugin(self, self.bot, bot_config)
-        self.bot.add_plugin(self.bot_plugin)
+        self.client = DiscordClient(self)
 
         self._children = {}
         self.message_queue = queue.Queue()
@@ -807,15 +811,15 @@ class PyLinkDiscordProtocol(PyLinkNetworkCoreWithUtils):
             chan = int(s)
         except (TypeError, ValueError):
             return False
-        return chan in self.bot_plugin.state.channels
+        return self.client.get_channel(chan) is not None
 
     def is_server_name(self, s):
         """Returns whether the string given is a valid IRC server name."""
-        return s in self.bot_plugin.state.guilds
+        return self.client.get_guild(s) is not None
 
     def is_internal_client(self, uid):
         """Returns whether the given client is an internal one."""
-        if uid == self.bot_plugin.me.id:
+        if uid == self.client.me.id:
             return True
         return super().is_internal_client(uid)
 
@@ -834,11 +838,11 @@ class PyLinkDiscordProtocol(PyLinkNetworkCoreWithUtils):
                 return entityid.split('@', 1)[0]
 
         if self.is_channel(entityid):
-            return str(self.bot_plugin.state.channels[entityid])
-        elif entityid in self.bot_plugin.state.users:
-            return self.bot_plugin.state.users[entityid].username
+            return str(self.client.get_channel(entityid))
+        elif self.client.get_user(entityid) is not None:
+            return self.client.get_user(entityid).name
         elif self.is_server_name(entityid):
-            return self.bot_plugin.state.guilds[entityid].name
+            return self.client.get_guild(entityid).name
         else:
             raise KeyError("Unknown entity ID %s" % str(entityid))
 
@@ -861,7 +865,7 @@ class PyLinkDiscordProtocol(PyLinkNetworkCoreWithUtils):
         # Generate a webhook name based off a configurable prefix and the channel ID
         webhook_name = '%s-%d' % (self.serverdata.get('webhook_name') or 'PyLinkRelay', channel.id)
 
-        for wh in channel.get_webhooks():
+        for wh in self.client.webhooks(channel):
             if wh.name == webhook_name:  # This hook matches our name
                 self.webhooks[channel.id] = wh
                 log.info('discord: Using existing webhook %s (%s) for channel %s', wh.id, webhook_name, channel)
@@ -940,7 +944,7 @@ class PyLinkDiscordProtocol(PyLinkNetworkCoreWithUtils):
             if sender:
                 user_fields = self._get_webhook_fields(sender)
 
-                if channel.guild:  # This message belongs to a channel
+                if isinstance(channel, GuildChannel):  # This message belongs to a channel
                     netobj = self._children[channel.guild.id]
 
                     # Note: skip webhook sending for messages that contain only spaces, as that fails with
@@ -952,8 +956,8 @@ class PyLinkDiscordProtocol(PyLinkNetworkCoreWithUtils):
 
                         try:
                             webhook = self._get_webhook(channel)
-                            webhook.execute(content=text[:self.MAX_MESSAGE_SIZE], username=webhook_fake_username, avatar_url=user_fields['avatar'])
-                        except APIException as e:
+                            self.client.webhook_execute(webhook, content=text[:self.MAX_MESSAGE_SIZE], username=webhook_fake_username, avatar_url=user_fields['avatar'])
+                        except HTTPException as e:
                             if e.code == 10015 and channel.id in self.webhooks:
                                 log.info("(%s) Invalidating webhook %s for channel %s due to Unknown Webhook error (10015)",
                                          self.name, self.webhooks[channel.id], channel)
@@ -970,7 +974,7 @@ class PyLinkDiscordProtocol(PyLinkNetworkCoreWithUtils):
                                     })
                             else:
                                 log.error("(%s) Caught API exception when sending webhook message to channel %s: %s/%s", self.name, channel, e.response.status_code, e.code)
-                            log.debug("(%s) APIException full traceback:", self.name, exc_info=True)
+                            log.debug("(%s) HTTPException full traceback:", self.name, exc_info=True)
 
                         except:
                             log.exception("(%s) Failed to send webhook message to channel %s", self.name, channel)
@@ -987,7 +991,7 @@ class PyLinkDiscordProtocol(PyLinkNetworkCoreWithUtils):
                     text = string.Template(pm_format).safe_substitute(user_fields)
 
             try:
-                channel.send_message(text[:self.MAX_MESSAGE_SIZE])
+                self.client.send(channel, text[:self.MAX_MESSAGE_SIZE])
             except Exception as e:
                 log.exception("(%s) Could not send message to channel %s (pylink_target=%s)", self.name, channel, pylink_target)
 
@@ -1057,7 +1061,7 @@ class PyLinkDiscordProtocol(PyLinkNetworkCoreWithUtils):
         self._message_thread = threading.Thread(name="Messaging thread for %s" % self.name,
                                                 target=self._message_builder, daemon=True)
         self._message_thread.start()
-        self.client.run()
+        self.client.start(self.serverdata['token'])
 
     def disconnect(self):
         """Disconnects from Discord and shuts down this network object."""
