@@ -541,35 +541,37 @@ class DiscordClient(Client):
     def _update_user_status(self, guild, uid, status):
         """Handles a Discord presence status update."""
         pylink_netobj = self.protocol._children.get(guild.id)
-        if pylink_netobj:
-            try:
-                u = pylink_netobj.users[uid]
-            except KeyError:
-                log.exception('(%s) _update_user_status: could not fetch user %s', self.protocol.name, uid)
-                return
+        if pylink_netobj is None:
+            return
 
-            if status != DiscordStatus.online:
-                awaymsg = self.status_mapping.get(status, 'Unknown Status')
-            else:
-                awaymsg = ''
+        try:
+            u = pylink_netobj.users[uid]
+        except KeyError:
+            log.exception('(%s) _update_user_status: could not fetch user %s', self.protocol.name, uid)
+            return
 
-            now_invisible = None
-            if not pylink_netobj.join_offline_users:
-                if status in (DiscordStatus.offline, DiscordStatus.invisible):
-                    # If we are hiding offline users, set a special flag for relay to quit the user.
-                    log.debug('(%s) Hiding user %s/%s from relay channels as they are offline', pylink_netobj.name,
-                              uid, pylink_netobj.get_friendly_name(uid))
-                    now_invisible = True
-                    u._invisible = True
-                elif (u.away in (self.status_mapping[DiscordStatus.invisible], self.status_mapping[DiscordStatus.offline])):
-                    # User was previously offline - burst them now.
-                    log.debug('(%s) Rejoining user %s/%s from as they are now online', pylink_netobj.name,
-                              uid, pylink_netobj.get_friendly_name(uid))
-                    now_invisible = False
-                    u._invisible = False
+        if status != DiscordStatus.online:
+            awaymsg = self.status_mapping.get(status, 'Unknown Status')
+        else:
+            awaymsg = ''
 
-            u.away = awaymsg
-            pylink_netobj.call_hooks([uid, 'AWAY', {'text': awaymsg, 'now_invisible': now_invisible}])
+        now_invisible = None
+        if not pylink_netobj.join_offline_users:
+            if status in (DiscordStatus.offline, DiscordStatus.invisible):
+                # If we are hiding offline users, set a special flag for relay to quit the user.
+                log.debug('(%s) Hiding user %s/%s from relay channels as they are offline', pylink_netobj.name,
+                          uid, pylink_netobj.get_friendly_name(uid))
+                now_invisible = True
+                u._invisible = True
+            elif (u.away in (self.status_mapping[DiscordStatus.invisible], self.status_mapping[DiscordStatus.offline])):
+                # User was previously offline - burst them now.
+                log.debug('(%s) Rejoining user %s/%s from as they are now online', pylink_netobj.name,
+                          uid, pylink_netobj.get_friendly_name(uid))
+                now_invisible = False
+                u._invisible = False
+
+        u.away = awaymsg
+        pylink_netobj.call_hooks([uid, 'AWAY', {'text': awaymsg, 'now_invisible': now_invisible}])
 
     async def on_member_update(self, old_member, member):
         self._update_user_status(member.guild, member.id, member.status)
