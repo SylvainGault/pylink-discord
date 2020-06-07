@@ -154,7 +154,7 @@ class DiscordClient(Client):
                 pylink_user = pylink_netobj.users[uid]
             except KeyError:
                 log.error("(%s) Could not update user %s(%s)/%s as the user object does not exist", self.protocol.name, guild.id, guild.name, uid)
-                return
+                continue
 
             channel_permissions = channel.permissions_for(member)
             has_perm = channel_permissions.read_messages
