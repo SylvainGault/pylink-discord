@@ -167,7 +167,7 @@ class DiscordClient(Client):
                     pylink_user.channels.add(channel.id)
                     pylink_channel.users.add(uid)
 
-                    # Hide offline users if join_offline_users is enabled
+                    # Join offline users if join_offline_users is enabled
                     if pylink_netobj.join_offline_users or (member.status not in
                                 (DiscordStatus.offline, DiscordStatus.invisible)):
                         users_joined.append(uid)
