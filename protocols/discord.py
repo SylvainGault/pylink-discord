@@ -161,44 +161,8 @@ class DiscordClient(Client):
             log.debug('discord: checking if member %s/%s has permission read_messages on %s/%s: %s',
                       member.id, member, channel.id, channel, has_perm)
             #log.debug('discord: channel permissions are %s', str(list(channel_permissions)))
-            if has_perm:
-                if uid not in pylink_channel.users:
-                    log.debug('discord: adding member %s to %s/%s', member, channel.id, channel)
-                    pylink_user.channels.add(channel.id)
-                    pylink_channel.users.add(uid)
 
-                    # Join offline users if join_offline_users is enabled
-                    if pylink_netobj.join_offline_users or (member.status not in
-                                (DiscordStatus.offline, DiscordStatus.invisible)):
-                        users_joined.append(uid)
-
-                # Map Discord role IDs to IRC modes
-                # e.g. 1234567890: 'op'
-                #      2345678901: 'voice'
-                role_map = pylink_netobj.serverdata.get('role_mode_map') or {}
-                # Track all modes the user is allowed to have, since multiple roles may map to one mode.
-                entitled_modes = {irc_mode for role_id, irc_mode in role_map.items() if role_id in member.roles}
-
-                # Optionally burst guild owner as IRC owner (+q)
-                if uid == guild.owner_id and pylink_netobj.serverdata.get('show_owner_status', True):
-                    entitled_modes.add('owner')
-                # Grant +qo and +ao instead of only +q and +a
-                if 'owner' in entitled_modes or 'admin' in entitled_modes:
-                    entitled_modes.add('op')
-
-                for mode, prefixlist in pylink_channel.prefixmodes.items():
-                    modechar = pylink_netobj.cmodes.get(mode)
-                    if not modechar:
-                        continue
-
-                    # New role added
-                    if mode in entitled_modes and uid not in prefixlist:
-                        modes.append(('+%s' % modechar, uid))
-                    # Matching role removed
-                    if mode not in entitled_modes and uid in prefixlist:
-                        modes.append(('-%s' % modechar, uid))
-
-            elif uid in pylink_channel.users and not has_perm:
+            if uid in pylink_channel.users and not has_perm:
                 log.debug('discord: parting member %s from %s/%s', member, channel.id, channel)
                 pylink_user.channels.discard(channel.id)
                 pylink_channel.remove_user(uid)
@@ -213,6 +177,47 @@ class DiscordClient(Client):
                         'text': "User removed from channel"
                     }
                 ])
+                continue
+
+            if not has_perm:
+                continue
+
+            if uid not in pylink_channel.users:
+                log.debug('discord: adding member %s to %s/%s', member, channel.id, channel)
+                pylink_user.channels.add(channel.id)
+                pylink_channel.users.add(uid)
+
+                # Join offline users if join_offline_users is enabled
+                if pylink_netobj.join_offline_users or (member.status not in
+                            (DiscordStatus.offline, DiscordStatus.invisible)):
+                    users_joined.append(uid)
+
+            # Map Discord role IDs to IRC modes
+            # e.g. 1234567890: 'op'
+            #      2345678901: 'voice'
+            role_map = pylink_netobj.serverdata.get('role_mode_map') or {}
+            # Track all modes the user is allowed to have, since multiple roles may map to one mode.
+            entitled_modes = {irc_mode for role_id, irc_mode in role_map.items() if role_id in member.roles}
+
+            # Optionally burst guild owner as IRC owner (+q)
+            if uid == guild.owner_id and pylink_netobj.serverdata.get('show_owner_status', True):
+                entitled_modes.add('owner')
+            # Grant +qo and +ao instead of only +q and +a
+            if 'owner' in entitled_modes or 'admin' in entitled_modes:
+                entitled_modes.add('op')
+
+            for mode, prefixlist in pylink_channel.prefixmodes.items():
+                modechar = pylink_netobj.cmodes.get(mode)
+                if not modechar:
+                    continue
+
+                # New role added
+                if mode in entitled_modes and uid not in prefixlist:
+                    modes.append(('+%s' % modechar, uid))
+                # Matching role removed
+                if mode not in entitled_modes and uid in prefixlist:
+                    modes.append(('-%s' % modechar, uid))
+
 
         # Note: once we've gotten here, it is possible that the channel was removed because the bot
         # no longer has access to it
