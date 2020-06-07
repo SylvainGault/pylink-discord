@@ -114,8 +114,6 @@ class DiscordClient(Client):
         Updates channel presence & IRC modes for the given member, or all guild members if not given.
         """
         if channel.type == ChannelType.category:
-            # XXX: there doesn't seem to be an easier way to get this. Fortunately, there usually
-            # aren't too many channels in one guild...
             for subchannel in channel.channels:
                 log.debug('(%s) _update_channel_presence: checking channel %s/%s in category %s/%s', self.protocol.name, subchannel.id, subchannel, channel.id, channel)
                 self._update_channel_presence(guild, subchannel, member=member, relay_modes=relay_modes)
